@@ -1,0 +1,15 @@
+# Render 用デプロイ設定。リポジトリ直下に置いて Render で "Blueprint" として読み込む。
+services:
+  - type: web
+    name: richmenu-proxy
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -b 0.0.0.0:$PORT --workers 2 --timeout 60 app:app
+    envVars:
+      - key: PROXY_KEY
+        sync: false          # Render の管理画面で値を設定（合言葉）
+      - key: ALLOW_ORIGIN
+        sync: false          # 管理ページの URL を設定
+      - key: PYTHON_VERSION
+        value: "3.12.4"
