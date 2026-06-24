@@ -1,75 +1,143 @@
 """
-LINE Messaging API 中継プロキシ（本番運用向け）
-================================================
-ブラウザから api.line.me は CORS で直接呼べないため、この中継サーバーを経由します。
+LINE Messaging API 中継プロキシ（トークン暗号化保存版）
+=========================================================
+- LINEのチャネルアクセストークンはこのプロキシだけが保持します。
+- トークンは暗号化して保存（保存先 Supabase / 鍵はこのプロキシのみ）。
+- 管理サイトは「合言葉(PROXY_KEY)」で認証し、store_id を指定するだけ。
+  ブラウザに生のトークンは残りません。
 
-トークンの扱い:
-  店舗ごとにトークンが異なるため、管理ページが Authorization ヘッダーで
-  トークンを送り、このプロキシはそれをそのまま LINE へ転送します
-  （サーバー側にトークンを保存しません）。
-  不正利用を防ぐため、X-Proxy-Key（合言葉）での簡易認証を必須にしています。
+必要な環境変数:
+  PROXY_KEY        管理サイトと共有する合言葉（推測されない長い文字列）
+  ENCRYPTION_KEY   Fernet鍵（下の生成コマンドで作る）。トークン暗号化に使用
+  SUPABASE_URL     例 https://xxxx.supabase.co
+  SUPABASE_KEY     Supabaseの service_role キー（サーバー専用・秘匿）
+  ALLOW_ORIGIN     管理サイトのURL（CORS）。例 https://richmenu-studio.netlify.app
+
+Fernet鍵の作り方（ローカルで1回）:
+  pip install cryptography
+  python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+  → 出力を ENCRYPTION_KEY に設定
+
+Supabaseに必要なテーブル（SQL Editorで実行）:
+  create table if not exists store_tokens (
+    store_id text primary key,
+    enc text not null,
+    updated_at timestamptz default now()
+  );
+  alter table store_tokens enable row level security;
+  -- service_role はRLSをバイパスするのでポリシー不要（anonからは触れない＝安全）
 
 起動:
   pip install -r requirements.txt
-  export PROXY_KEY="任意の長い合言葉"
-  export ALLOW_ORIGIN="https://あなたの管理ページのURL"
-  gunicorn -b 0.0.0.0:$PORT app:app      # 本番
-  python app.py                          # ローカル確認
+  gunicorn -b 0.0.0.0:$PORT app:app
 """
 
 import os
-from flask import Flask, request, Response, abort
-from flask_cors import CORS
 import requests
+from flask import Flask, request, Response, jsonify, abort
+from flask_cors import CORS
+from cryptography.fernet import Fernet
 
-# ── 環境変数 ──────────────────────────────────────────────
-ALLOW_ORIGIN = os.environ.get("ALLOW_ORIGIN", "*")   # 管理ページのURL。* は本番非推奨
-PROXY_KEY    = os.environ.get("PROXY_KEY")            # 合言葉（未設定なら認証なし＝開発用）
-TIMEOUT      = int(os.environ.get("TIMEOUT", "30"))
+PROXY_KEY      = os.environ["PROXY_KEY"]
+ENCRYPTION_KEY = os.environ["ENCRYPTION_KEY"].encode()
+SUPABASE_URL   = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
+ALLOW_ORIGIN   = os.environ.get("ALLOW_ORIGIN", "*")
 
+fernet = Fernet(ENCRYPTION_KEY)
 app = Flask(__name__)
-CORS(
-    app,
-    origins=ALLOW_ORIGIN,
-    allow_headers=["Content-Type", "Authorization", "X-Proxy-Key"],
-    methods=["GET", "POST", "DELETE", "OPTIONS"],
-)
+CORS(app, origins=ALLOW_ORIGIN,
+     allow_headers=["Content-Type", "X-Proxy-Key", "X-Store-Id"],
+     methods=["GET", "POST", "DELETE", "OPTIONS"])
+
+SB_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+}
+
+
+def require_key():
+    if request.headers.get("X-Proxy-Key") != PROXY_KEY:
+        abort(401)
+
+
+def store_put(store_id, token):
+    enc = fernet.encrypt(token.encode()).decode()
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/store_tokens",
+        headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+        json={"store_id": store_id, "enc": enc},
+    )
+    r.raise_for_status()
+
+
+def store_get(store_id):
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/store_tokens",
+        headers=SB_HEADERS,
+        params={"store_id": f"eq.{store_id}", "select": "enc"},
+    )
+    r.raise_for_status()
+    rows = r.json()
+    if not rows:
+        return None
+    return fernet.decrypt(rows[0]["enc"].encode()).decode()
+
+
+# ── 管理サイト → トークン登録（生のトークンはここで暗号化され、以後は出ない） ──
+@app.route("/token", methods=["POST", "OPTIONS"])
+def set_token():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    require_key()
+    body = request.get_json(force=True)
+    sid = (body or {}).get("store_id")
+    tok = (body or {}).get("token")
+    if not sid or not tok:
+        return jsonify(error="store_id and token required"), 400
+    store_put(sid, tok)
+    return jsonify(ok=True)
+
+
+# ── 設定状況の確認（トークン自体は返さない） ──
+@app.route("/token-status/<store_id>", methods=["GET", "OPTIONS"])
+def token_status(store_id):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    require_key()
+    try:
+        exists = store_get(store_id) is not None
+    except Exception:
+        exists = False
+    return jsonify(set=exists)
 
 
 @app.route("/healthz")
 def healthz():
-    return {"ok": True}
+    return jsonify(ok=True)
 
 
+# ── LINE API 中継（store_id を指定。トークンはサーバー側で付与） ──
 @app.route("/<path:p>", methods=["GET", "POST", "DELETE", "OPTIONS"])
 def proxy(p):
     if request.method == "OPTIONS":
         return ("", 204)
+    require_key()
+    sid = request.headers.get("X-Store-Id")
+    if not sid:
+        return jsonify(error="X-Store-Id required"), 400
+    token = store_get(sid)
+    if not token:
+        return jsonify(error="token not set for this store"), 400
 
-    # 合言葉チェック（設定されている場合のみ）
-    if PROXY_KEY and request.headers.get("X-Proxy-Key") != PROXY_KEY:
-        abort(401)
-
-    # 画像アップロード(/content)は api-data、それ以外は api ホスト
     host = "https://api-data.line.me" if "/content" in p else "https://api.line.me"
-
-    headers = {}
-    auth = request.headers.get("Authorization")  # 管理ページから来たトークンを転送
-    if auth:
-        headers["Authorization"] = auth
+    headers = {"Authorization": f"Bearer {token}"}
     ct = request.headers.get("Content-Type")
     if ct:
         headers["Content-Type"] = ct
-
-    try:
-        r = requests.request(
-            request.method, f"{host}/{p}",
-            headers=headers, data=request.get_data(), timeout=TIMEOUT,
-        )
-    except requests.RequestException as e:
-        return Response('{"error":"upstream_error","detail":%r}' % str(e),
-                        502, content_type="application/json")
-
+    r = requests.request(request.method, f"{host}/{p}",
+                         headers=headers, data=request.get_data(), timeout=30)
     return Response(r.content, r.status_code,
                     content_type=r.headers.get("Content-Type", "application/json"))
 
