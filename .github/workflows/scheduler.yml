@@ -1,8 +1,8 @@
 name: richmenu-scheduler
 on:
   schedule:
-    - cron: "*/30 * * * *"   # 30分おき（UTC基準・GitHub仕様で多少前後あり）
-  workflow_dispatch:          # 手動実行ボタンも有効化
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -11,8 +11,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r richmenu_proxy/requirements.txt
-      - run: python richmenu_proxy/scheduler.py
+      - run: pip install -r requirements.txt
+      - run: python scheduler.py
         env:
           ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
           SUPABASE_URL:   ${{ secrets.SUPABASE_URL }}
